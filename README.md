@@ -43,7 +43,7 @@ pip install -r requirements.txt
 Make sure your `.env` file contains the necessary environment variables:
 ```
 OPENAI_API_KEY=your_openai_api_key_here
-DATABASE_URL=postgresql://ai_planet_user:S7iezLQHQSWZIPq3eQFDtS0xEPjUNJb6@dpg-d30kgv56ubrc73f50m70-a.oregon-postgres.render.com/ai_planet
+DATABASE_URL=postgresql://username:password@host:port/database_name
 SECRET_KEY=your_secret_key_here_change_in_production
 ```
 
