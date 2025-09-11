@@ -1,4 +1,8 @@
-from fastapi import FastAPI, HTTPException, Depends, Query
+import tempfile
+import hashlib
+from fastapi import UploadFile, File
+from fastapi import FastAPI, HTTPException, Depends
+from fastapi.params import Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
@@ -16,7 +20,8 @@ import requests
 from contextlib import asynccontextmanager
 
 # Import database components
-from database import get_db, init_db, Component, Query, Workflow, ComponentTypeEnum, QueryStatusEnum
+from database import get_db, init_db, Component, Workflow, ComponentTypeEnum, QueryStatusEnum
+from database import Query as DBQuery
 
 # Load environment variables
 load_dotenv()
@@ -227,6 +232,107 @@ class ChatQueryRequest(BaseModel):
                              description="Workflow ID to use for processing")
     message: str = Field(..., description="User message")
 
+
+# Enhanced Workflow Structure Models
+class WorkflowNode(BaseModel):
+    id: str = Field(..., description="Node ID (same as component ID)")
+    type: str = Field(..., description="Component type")
+    position: Dict[str, float] = Field(...,
+                                       description="X,Y position on canvas")
+    data: Dict[str, Any] = Field(
+        default_factory=dict, description="Node data/configuration")
+
+
+class WorkflowEdge(BaseModel):
+    id: str = Field(..., description="Edge ID")
+    source: str = Field(..., description="Source node ID")
+    target: str = Field(..., description="Target node ID")
+    type: str = Field(default="default", description="Edge type")
+
+
+class EnhancedWorkflowCreate(BaseModel):
+    name: str = Field(..., description="Workflow name")
+    description: Optional[str] = Field(
+        None, description="Workflow description")
+    nodes: List[WorkflowNode] = Field(
+        default_factory=list, description="Workflow nodes")
+    edges: List[WorkflowEdge] = Field(
+        default_factory=list, description="Workflow edges")
+
+
+class EnhancedWorkflowResponse(BaseModel):
+    id: str
+    name: str
+    description: Optional[str]
+    nodes: List[WorkflowNode]
+    edges: List[WorkflowEdge]
+    is_valid: bool
+    validation_issues: List[str]
+    created_at: datetime
+    updated_at: datetime
+
+
+# Document Upload Models
+class DocumentUploadResponse(BaseModel):
+    document_id: str
+    filename: str
+    size: int
+    content_type: str
+    processing_status: str
+    uploaded_at: datetime
+
+
+class DocumentProcessingStatus(BaseModel):
+    document_id: str
+    filename: str
+    status: str  # processing, completed, failed
+    chunks_created: int
+    embeddings_created: int
+    error_message: Optional[str]
+    processed_at: Optional[datetime]
+
+
+# Component Validation Models
+class ComponentValidationRequest(BaseModel):
+    component_type: str = Field(...,
+                                description="Type of component to validate")
+    configuration: Dict[str, Any] = Field(...,
+                                          description="Component configuration to validate")
+
+
+class ComponentValidationResponse(BaseModel):
+    valid: bool
+    errors: List[str]
+    warnings: List[str]
+    suggested_fixes: List[str]
+
+
+# Enhanced Execution Models
+class ExecutionStepDetail(BaseModel):
+    component_id: str
+    component_name: str
+    component_type: str
+    step_number: int
+    status: str  # pending, processing, completed, failed
+    started_at: Optional[datetime]
+    completed_at: Optional[datetime]
+    input_data: Dict[str, Any]
+    output_data: Dict[str, Any]
+    error_message: Optional[str]
+    processing_time_ms: Optional[int]
+
+
+class EnhancedWorkflowExecutionResponse(BaseModel):
+    execution_id: str
+    workflow_id: str
+    query: str
+    status: str
+    result: Dict[str, Any]
+    execution_steps: List[ExecutionStepDetail]
+    total_processing_time_ms: int
+    created_at: datetime
+    completed_at: Optional[datetime]
+
 # Helper functions
 
 
@@ -371,7 +477,7 @@ def db_component_to_response(component: Component) -> UserQueryComponentResponse
     )
 
 
-def db_query_to_response(query: Query) -> UserQueryResponse:
+def db_query_to_response(query: DBQuery) -> UserQueryResponse:
     """Convert database Query to UserQueryResponse"""
     return UserQueryResponse(
         id=str(query.id),
@@ -586,7 +692,7 @@ async def submit_user_query(query_request: UserQueryRequest, db: Session = Depen
             raise HTTPException(
                 status_code=400, detail="Invalid workflow ID format")
 
-    db_query = Query(
+    db_query = DBQuery(
         query=query_request.query,
         component_id=component_uuid,
         workflow_id=workflow_uuid,
@@ -622,7 +728,7 @@ async def get_query_status(query_id: str, db: Session = Depends(get_db)):
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid query ID format")
 
-    db_query = db.query(Query).filter(Query.id == query_uuid).first()
+    db_query = db.query(DBQuery).filter(DBQuery.id == query_uuid).first()
 
     if not db_query:
         raise HTTPException(status_code=404, detail="Query not found")
@@ -635,12 +741,12 @@ async def list_queries(component_id: Optional[str] = None, workflow_id: Optional
     """
     List all queries, optionally filtered by component_id or workflow_id
     """
-    query = db.query(Query)
+    query = db.query(DBQuery)
 
     if component_id:
         try:
             component_uuid = uuid.UUID(component_id)
-            query = query.filter(Query.component_id == component_uuid)
+            query = query.filter(DBQuery.component_id == component_uuid)
         except ValueError:
             raise HTTPException(
                 status_code=400, detail="Invalid component ID format")
@@ -648,7 +754,7 @@ async def list_queries(component_id: Optional[str] = None, workflow_id: Optional
     if workflow_id:
         try:
             workflow_uuid = uuid.UUID(workflow_id)
-            query = query.filter(Query.workflow_id == workflow_uuid)
+            query = query.filter(DBQuery.workflow_id == workflow_uuid)
         except ValueError:
             raise HTTPException(
                 status_code=400, detail="Invalid workflow ID format")
@@ -1082,6 +1188,404 @@ async def chat_with_workflow(
     except Exception as e:
         raise HTTPException(
             status_code=500, detail=f"Chat processing failed: {str(e)}")
+
+
+# ==========================================
+# ENHANCED WORKFLOW BUILDER APIs
+# ==========================================
+
+@app.post("/api/workflows/enhanced", response_model=EnhancedWorkflowResponse)
+async def create_enhanced_workflow(workflow: EnhancedWorkflowCreate, db: Session = Depends(get_db)):
+    """
+    Create an enhanced workflow with nodes and edges for visual workflow builder
+    """
+    # Validate workflow structure
+    validation_issues = []
+
+    # Check for duplicate node IDs
+    node_ids = [node.id for node in workflow.nodes]
+    if len(node_ids) != len(set(node_ids)):
+        validation_issues.append("Duplicate node IDs found")
+
+    # Check edge connections
+    for edge in workflow.edges:
+        if edge.source not in node_ids:
+            validation_issues.append(
+                f"Edge {edge.id}: source node {edge.source} not found")
+        if edge.target not in node_ids:
+            validation_issues.append(
+                f"Edge {edge.id}: target node {edge.target} not found")
+
+    # Check for required component types
+    node_types = [node.type for node in workflow.nodes]
+    if "user_query" not in node_types:
+        validation_issues.append("Workflow must have a User Query component")
+    if "output" not in node_types:
+        validation_issues.append("Workflow must have an Output component")
+
+    is_valid = len(validation_issues) == 0
+
+    # Convert nodes and edges to storage format
+    components = [node.id for node in workflow.nodes]
+    connections = [{"from_component_id": edge.source,
+                    "to_component_id": edge.target, "type": edge.type} for edge in workflow.edges]
+
+    # Store workflow
+    db_workflow = Workflow(
+        name=workflow.name,
+        description=workflow.description,
+        components=components,
+        connections=connections
+    )
+
+    db.add(db_workflow)
+    db.commit()
+    db.refresh(db_workflow)
+
+    return EnhancedWorkflowResponse(
+        id=str(db_workflow.id),
+        name=db_workflow.name,
+        description=db_workflow.description,
+        nodes=workflow.nodes,
+        edges=workflow.edges,
+        is_valid=is_valid,
+        validation_issues=validation_issues,
+        created_at=db_workflow.created_at,
+        updated_at=db_workflow.updated_at
+    )
+
+
+@app.get("/api/workflows/enhanced/{workflow_id}", response_model=EnhancedWorkflowResponse)
+async def get_enhanced_workflow(workflow_id: str, db: Session = Depends(get_db)):
+    """
+    Get enhanced workflow with nodes and edges for visual display
+    """
+    try:
+        workflow_uuid = uuid.UUID(workflow_id)
+    except ValueError:
+        raise HTTPException(
+            status_code=400, detail="Invalid workflow ID format")
+
+    workflow = db.query(Workflow).filter(Workflow.id == workflow_uuid).first()
+    if not workflow:
+        raise HTTPException(status_code=404, detail="Workflow not found")
+
+    # Get components to build nodes
+    if workflow.components:
+        component_ids = [uuid.UUID(comp_id) for comp_id in workflow.components]
+        components = db.query(Component).filter(
+            Component.id.in_(component_ids)).all()
+    else:
+        components = []
+
+    # Build nodes
+    nodes = []
+    for i, component in enumerate(components):
+        nodes.append(WorkflowNode(
+            id=str(component.id),
+            type=component.component_type.value,
+            position={"x": i * 200, "y": 100},  # Default positioning
+            data={
+                "name": component.name,
+                "description": component.description,
+                "configuration": component.configuration
+            }
+        ))
+
+    # Build edges
+    edges = []
+    if workflow.connections:
+        for i, conn in enumerate(workflow.connections):
+            edges.append(WorkflowEdge(
+                id=f"edge-{i}",
+                source=conn.get("from_component_id"),
+                target=conn.get("to_component_id"),
+                type=conn.get("type", "default")
+            ))
+
+    # Validate workflow
+    validation_issues = []
+    if not nodes:
+        validation_issues.append("Workflow has no components")
+    if not edges:
+        validation_issues.append("Workflow has no connections")
+
+    return EnhancedWorkflowResponse(
+        id=str(workflow.id),
+        name=workflow.name,
+        description=workflow.description,
+        nodes=nodes,
+        edges=edges,
+        is_valid=len(validation_issues) == 0,
+        validation_issues=validation_issues,
+        created_at=workflow.created_at,
+        updated_at=workflow.updated_at
+    )
+
+
+# ==========================================
+# COMPONENT VALIDATION APIs
+# ==========================================
+
+@app.post("/api/components/validate", response_model=ComponentValidationResponse)
+async def validate_component_configuration(request: ComponentValidationRequest):
+    """
+    Validate component configuration before creation/update
+    """
+    errors = []
+    warnings = []
+    suggested_fixes = []
+
+    component_type = request.component_type
+    config = request.configuration
+
+    # Validate based on component type
+    if component_type == "user_query":
+        if not config.get("placeholder_text"):
+            warnings.append("Placeholder text is recommended for better UX")
+            suggested_fixes.append("Add placeholder_text to configuration")
+
+        max_length = config.get("max_length", 0)
+        if max_length <= 0 or max_length > 5000:
+            errors.append("max_length must be between 1 and 5000")
+
+    elif component_type == "llm_engine":
+        if not config.get("model"):
+            errors.append("model is required")
+
+        temperature = config.get("temperature", 0.7)
+        if not 0 <= temperature <= 2:
+            errors.append("temperature must be between 0 and 2")
+
+        max_tokens = config.get("max_tokens")
+        if max_tokens and (max_tokens <= 0 or max_tokens > 4000):
+            warnings.append("max_tokens should be between 1 and 4000")
+
+        if not config.get("system_prompt"):
+            warnings.append("System prompt helps guide AI behavior")
+            suggested_fixes.append("Add system_prompt to configuration")
+
+    elif component_type == "knowledge_base":
+        if not config.get("embedding_model"):
+            errors.append("embedding_model is required")
+
+        chunk_size = config.get("chunk_size", 1000)
+        if chunk_size <= 0 or chunk_size > 5000:
+            warnings.append("chunk_size should be between 100 and 5000")
+
+    elif component_type == "output":
+        format_type = config.get("response_format", "text")
+        if format_type not in ["text", "json", "markdown"]:
+            errors.append(
+                "response_format must be 'text', 'json', or 'markdown'")
+
+    else:
+        errors.append(f"Unknown component type: {component_type}")
+
+    return ComponentValidationResponse(
+        valid=len(errors) == 0,
+        errors=errors,
+        warnings=warnings,
+        suggested_fixes=suggested_fixes
+    )
+
+
+# ==========================================
+# DOCUMENT UPLOAD APIs
+# ==========================================
+
+
+@app.post("/api/documents/upload", response_model=DocumentUploadResponse)
+async def upload_document(component_id: str = Query(description="Knowledge Base component ID"),
+                          file: UploadFile = File(description="Document file to upload")):
+    """
+    Upload a document to a Knowledge Base component
+    """
+    try:
+        component_uuid = uuid.UUID(component_id)
+    except ValueError:
+        raise HTTPException(
+            status_code=400, detail="Invalid component ID format")
+
+    # Validate file type
+    allowed_types = ["application/pdf", "text/plain", "application/msword",
+                     "application/vnd.openxmlformats-officedocument.wordprocessingml.document"]
+    if file.content_type not in allowed_types:
+        raise HTTPException(
+            status_code=400, detail="Unsupported file type. Allowed: PDF, TXT, DOC, DOCX")
+
+    # Generate document ID
+    doc_id = generate_id()
+
+    # Save file temporarily (in production, use cloud storage)
+    temp_dir = tempfile.gettempdir()
+    file_path = os.path.join(temp_dir, f"{doc_id}_{file.filename}")
+
+    try:
+        contents = await file.read()
+        with open(file_path, "wb") as f:
+            f.write(contents)
+
+        # For now, just return upload success
+        # In full implementation, you'd process the document here
+        return DocumentUploadResponse(
+            document_id=doc_id,
+            filename=file.filename,
+            size=len(contents),
+            content_type=file.content_type,
+            processing_status="uploaded",
+            uploaded_at=get_current_timestamp()
+        )
+
+    except Exception as e:
+        raise HTTPException(
+            status_code=500, detail=f"Failed to upload document: {str(e)}")
+
+
+@app.get("/api/documents/{document_id}/status", response_model=DocumentProcessingStatus)
+async def get_document_processing_status(document_id: str):
+    """
+    Get document processing status
+    """
+    # For now, return mock status
+    # In full implementation, check actual processing status
+    return DocumentProcessingStatus(
+        document_id=document_id,
+        filename="sample.pdf",
+        status="completed",
+        chunks_created=10,
+        embeddings_created=10,
+        error_message=None,
+        processed_at=get_current_timestamp()
+    )
+
+
+# ==========================================
+# ENHANCED EXECUTION API
+# ==========================================
+
+@app.post("/api/workflows/execute/enhanced", response_model=EnhancedWorkflowExecutionResponse)
+async def execute_workflow_enhanced(request: WorkflowExecutionRequest, db: Session = Depends(get_db)):
+    """
+    Enhanced workflow execution with detailed step-by-step feedback for visual display
+    """
+    import time
+
+    try:
+        workflow_uuid = uuid.UUID(request.workflow_id)
+    except ValueError:
+        raise HTTPException(
+            status_code=400, detail="Invalid workflow ID format")
+
+    # Get workflow
+    workflow = db.query(Workflow).filter(Workflow.id == workflow_uuid).first()
+    if not workflow:
+        raise HTTPException(status_code=404, detail="Workflow not found")
+
+    # Get components in execution order
+    components = get_workflow_components_in_order(workflow, db)
+    if not components:
+        raise HTTPException(
+            status_code=400, detail="Invalid workflow: no valid component chain found")
+
+    # Create execution record
+    execution_id = generate_id()
+    execution_steps = []
+    current_data = {"query": request.query, "context": request.context}
+    total_start_time = time.time()
+
+    try:
+        # Execute each component in order with detailed tracking
+        for i, component in enumerate(components):
+            step_start_time = time.time()
+            step_start_dt = get_current_timestamp()
+
+            # Create step detail
+            step_detail = ExecutionStepDetail(
+                component_id=str(component.id),
+                component_name=component.name,
+                component_type=component.component_type.value,
+                step_number=i + 1,
+                status="processing",
+                started_at=step_start_dt,
+                completed_at=None,
+                input_data=current_data.copy(),
+                output_data={},
+                error_message=None,
+                processing_time_ms=None
+            )
+
+            # Execute component
+            if component.component_type == ComponentTypeEnum.USER_QUERY:
+                step_result = {
+                    "success": True,
+                    "query_received": current_data["query"],
+                    "message": "Query received and validated"
+                }
+                step_detail.output_data = step_result
+
+            elif component.component_type == ComponentTypeEnum.KNOWLEDGE_BASE:
+                step_result = execute_knowledge_base_component(
+                    component, current_data["query"])
+                step_detail.output_data = step_result
+                if step_result.get("success"):
+                    current_data["context"] = step_result.get("context", "")
+
+            elif component.component_type == ComponentTypeEnum.LLM_ENGINE:
+                context = current_data.get("context")
+                step_result = execute_llm_component(
+                    component, current_data["query"], context)
+                step_detail.output_data = step_result
+                if step_result.get("success"):
+                    current_data["response"] = step_result.get("response", "")
+
+            elif component.component_type == ComponentTypeEnum.OUTPUT:
+                step_result = execute_output_component(component, current_data)
+                step_detail.output_data = step_result
+
+            # Complete step timing
+            step_end_time = time.time()
+            step_detail.completed_at = get_current_timestamp()
+            step_detail.processing_time_ms = int(
+                (step_end_time - step_start_time) * 1000)
+            step_detail.status = "completed" if step_result.get(
+                "success", False) else "failed"
+
+            if not step_result.get("success", False):
+                step_detail.error_message = step_result.get(
+                    "error", "Unknown error")
+
+            execution_steps.append(step_detail)
+
+            # Stop execution if step failed
+            if not step_result.get("success", False):
+                break
+
+        # Calculate total time
+        total_end_time = time.time()
+        total_time_ms = int((total_end_time - total_start_time) * 1000)
+
+        # Determine final status
+        final_status = "completed" if all(
+            step.status == "completed" for step in execution_steps) else "failed"
+
+        return EnhancedWorkflowExecutionResponse(
+            execution_id=execution_id,
+            workflow_id=request.workflow_id,
+            query=request.query,
+            status=final_status,
+            result=current_data,
+            execution_steps=execution_steps,
+            total_processing_time_ms=total_time_ms,
+            created_at=get_current_timestamp(),
+            completed_at=get_current_timestamp() if final_status == "completed" else None
+        )
+
+    except Exception as e:
+        # Handle execution errors
+        raise HTTPException(
+            status_code=500, detail=f"Enhanced workflow execution failed: {str(e)}")
+
 
 if __name__ == "__main__":
     import uvicorn
