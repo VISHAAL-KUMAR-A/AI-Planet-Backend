@@ -14,8 +14,11 @@ alembic>=1.13.0
 # HTTP Client
 httpx>=0.25.0
 
-# AI/ML Libraries (commented out for now - add when needed)
-# openai>=1.3.0
+# AI/ML Libraries
+openai>=1.3.0
+requests>=2.31.0
+
+# File Processing (commented out for now - add when needed for document upload)
 # chromadb>=0.4.0
 # PyMuPDF>=1.23.0  # Requires Visual Studio Build Tools on Windows
 # google-generativeai>=0.3.0
